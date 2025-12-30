@@ -1,0 +1,11 @@
+# Compiled binaries
+oblivion
+*.o
+*.out
+
+# Logs
+*.log
+
+# Editor backup files
+*.swp
+*~
