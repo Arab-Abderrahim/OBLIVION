@@ -13,6 +13,7 @@
 #define END_PORT 1024
 #define MAX_THREADS 100
 #define TIMEOUT 1
+#define MAX_RESULTS 4096
 
 typedef struct {
     char ip[INET6_ADDRSTRLEN];
@@ -21,13 +22,15 @@ typedef struct {
     char banner[256];
 } ScanResult;
 
-ScanResult results[4096];
+/* ================= GLOBAL STATE ================= */
+ScanResult results[MAX_RESULTS];
 int result_count = 0;
 int scanned_ports = 0;
 int total_ports = END_PORT - START_PORT + 1;
 
 pthread_mutex_t result_lock;
 pthread_mutex_t progress_lock;
+pthread_mutex_t print_lock;
 sem_t thread_sem;
 
 /* ================= LOGO ================= */
@@ -40,7 +43,7 @@ void print_logo() {
 "  ██║   ██║██╔══██╗██║     ██║╚██╗ ██╔╝██║██║   ██║██║╚██╗██║\n"
 "  ╚██████╔╝██████╔╝███████╗██║ ╚████╔╝ ██║╚██████╔╝██║ ╚████║\n"
 "   ╚═════╝ ╚═════╝ ╚══════╝╚═╝  ╚═══╝  ╚═╝ ╚═════╝ ╚═╝  ╚═══╝\n"
-"        Ethical Network Recon Scanner (Education)\n"
+"        Oblivion — Ethical Network Scanner\n"
 "=====================================================\n\n"
     );
 }
@@ -55,6 +58,14 @@ void detect_service(int port, char *out) {
     else strcpy(out, "UNKNOWN");
 }
 
+/* ================= BANNER SANITIZE ================= */
+void sanitize(char *s) {
+    for (; *s; s++) {
+        if (*s == '"' || *s == '\n' || *s == '\r')
+            *s = ' ';
+    }
+}
+
 /* ================= BANNER GRAB ================= */
 void grab_banner(int sock, const char *service, char *out) {
     char buf[512] = {0};
@@ -64,13 +75,15 @@ void grab_banner(int sock, const char *service, char *out) {
     }
 
     int r = recv(sock, buf, sizeof(buf) - 1, 0);
-    if (r > 0)
+    if (r > 0) {
         strncpy(out, buf, 255);
-    else
+        sanitize(out);
+    } else {
         strcpy(out, "No banner received");
+    }
 }
 
-/* ================= SCAN FUNCTION ================= */
+/* ================= SCAN THREAD ================= */
 void *scan_port(void *arg) {
     char **data = (char **)arg;
     char *ip = data[0];
@@ -78,7 +91,7 @@ void *scan_port(void *arg) {
 
     sem_wait(&thread_sem);
 
-    struct addrinfo hints = {0}, *res;
+    struct addrinfo hints = {0}, *res = NULL;
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%d", port);
 
@@ -89,10 +102,8 @@ void *scan_port(void *arg) {
         goto cleanup;
 
     int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock < 0) {
-        freeaddrinfo(res);
-        goto cleanup;
-    }
+    if (sock < 0)
+        goto cleanup_addr;
 
     struct timeval tv = {TIMEOUT, 0};
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -105,25 +116,34 @@ void *scan_port(void *arg) {
         grab_banner(sock, r.service, r.banner);
 
         pthread_mutex_lock(&result_lock);
-        results[result_count++] = r;
+        if (result_count < MAX_RESULTS)
+            results[result_count++] = r;
         pthread_mutex_unlock(&result_lock);
 
-        printf("[OPEN] %s:%d (%s)\n", ip, port, r.service);
+        pthread_mutex_lock(&print_lock);
+        printf("\n[OPEN] %s:%d (%s)\n", r.ip, r.port, r.service);
+        printf("------- Banner -------\n%s\n----------------------\n", r.banner);
+        pthread_mutex_unlock(&print_lock);
     }
 
     close(sock);
+
+cleanup_addr:
     freeaddrinfo(res);
 
 cleanup:
     pthread_mutex_lock(&progress_lock);
     scanned_ports++;
+    pthread_mutex_lock(&print_lock);
     printf("\rProgress: %.2f%%", (scanned_ports * 100.0) / total_ports);
     fflush(stdout);
+    pthread_mutex_unlock(&print_lock);
     pthread_mutex_unlock(&progress_lock);
 
     sem_post(&thread_sem);
-    free(data[1]);
+
     free(data[0]);
+    free(data[1]);
     free(data);
     return NULL;
 }
@@ -137,25 +157,23 @@ void export_results() {
         printf("\n\nExport results as:\n1) TXT\n2) JSON\nChoice: ");
         if (scanf("%d", &choice) != 1) {
             while (getchar() != '\n');
-            printf("Invalid input. Try again.\n");
+            printf("Invalid input.\n");
             continue;
         }
 
         if (choice == 1) {
             f = fopen("oblivion.txt", "w");
             break;
-        }
-        else if (choice == 2) {
+        } else if (choice == 2) {
             f = fopen("oblivion.json", "w");
             break;
-        }
-        else {
-            printf("Invalid choice. Enter 1 or 2.\n");
+        } else {
+            printf("Enter 1 or 2.\n");
         }
     }
 
     if (!f) {
-        perror("File creation failed");
+        perror("File error");
         return;
     }
 
@@ -185,7 +203,7 @@ void export_results() {
     }
 
     fclose(f);
-    printf("Results exported successfully.\n");
+    printf("\nResults exported successfully.\n");
 }
 
 /* ================= MAIN ================= */
@@ -194,8 +212,8 @@ int main() {
 
     char target[128];
     printf("Enter target IP or IPv6: ");
-    if (scanf("%127s", target) != 1 || strlen(target) == 0) {
-        printf("Invalid target.\n");
+    if (scanf("%127s", target) != 1) {
+        printf("Invalid input.\n");
         return 1;
     }
 
@@ -208,9 +226,10 @@ int main() {
 
     pthread_mutex_init(&result_lock, NULL);
     pthread_mutex_init(&progress_lock, NULL);
+    pthread_mutex_init(&print_lock, NULL);
     sem_init(&thread_sem, 0, MAX_THREADS);
 
-    pthread_t threads[END_PORT];
+    pthread_t threads[total_ports];
 
     for (int p = START_PORT; p <= END_PORT; p++) {
         char **args = malloc(sizeof(char *) * 2);
@@ -218,13 +237,10 @@ int main() {
         args[1] = malloc(8);
         sprintf(args[1], "%d", p);
 
-        if (pthread_create(&threads[p - 1], NULL, scan_port, args) != 0) {
-            perror("Thread creation failed");
-            return 1;
-        }
+        pthread_create(&threads[p - START_PORT], NULL, scan_port, args);
     }
 
-    for (int i = 0; i < END_PORT; i++)
+    for (int i = 0; i < total_ports; i++)
         pthread_join(threads[i], NULL);
 
     export_results();
