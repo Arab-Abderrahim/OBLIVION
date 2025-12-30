@@ -199,12 +199,12 @@ int main() {
         return 1;
     }
 
-    struct addrinfo test;
+    struct addrinfo *test = NULL;
     if (getaddrinfo(target, NULL, NULL, &test) != 0) {
         printf("Invalid IP address.\n");
         return 1;
     }
-    freeaddrinfo(&test);
+    freeaddrinfo(test);
 
     pthread_mutex_init(&result_lock, NULL);
     pthread_mutex_init(&progress_lock, NULL);
